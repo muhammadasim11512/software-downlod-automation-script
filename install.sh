@@ -1,16 +1,17 @@
 #!/bin/bash
 # =============================================================================
-#  DevOps One-Click Installer + Smoke Tests
-#  Installs: RabbitMQ · Redis · Keycloak · JasperReports Server
+#  DevOps One-Click Installer
+#  Installs: RabbitMQ · Redis · Keycloak (Docker) · JasperReports Server
 #
 #  Supported OS:
 #    Ubuntu 20 / 22 / 24
 #    Debian 11 / 12
+#    Kali Linux
 #    CentOS / RHEL 7 / 8 / 9
 #    Rocky Linux / AlmaLinux 8 / 9
 #    Fedora 38+
 #
-#  One-liner (no clone needed):
+#  One-liner:
 #    curl -fsSL https://raw.githubusercontent.com/muhammadasim11512/software-downlod-automation-script/main/install.sh | sudo bash
 #
 #  With clone:
@@ -21,20 +22,20 @@
 #    --skip-redis      Skip Redis
 #    --skip-keycloak   Skip Keycloak
 #    --skip-jasper     Skip JasperReports
-#    --test-only       Run smoke tests only (no install)
-#    --help            Show this help
+#    --test-only       Run smoke tests only
+#    --help            Show help
 # =============================================================================
 
 set -uo pipefail
 
 # =============================================================================
-# PINNED VERSIONS
+# VERSIONS — edit here to upgrade
 # =============================================================================
 KEYCLOAK_VERSION="24.0.4"
 JASPER_VERSION="8.2.0"
 
 # =============================================================================
-# DEFAULT PORTS  (auto-switched if busy)
+# DEFAULT PORTS — auto-switched if busy
 # =============================================================================
 RABBITMQ_PORT=5672
 RABBITMQ_MGMT_PORT=15672
@@ -43,7 +44,13 @@ KEYCLOAK_PORT=8080
 JASPER_PORT=8081
 
 # =============================================================================
-# INSTALL FLAGS
+# CREDENTIALS
+# =============================================================================
+KEYCLOAK_ADMIN_USER="admin"
+KEYCLOAK_ADMIN_PASS="admin"
+
+# =============================================================================
+# FLAGS
 # =============================================================================
 INSTALL_RABBITMQ=true
 INSTALL_REDIS=true
@@ -112,10 +119,11 @@ check_root() {
 }
 
 # =============================================================================
-# OS DETECTION
+# OS DETECTION — supports all major Linux distros including Kali
 # =============================================================================
 OS=""
 OS_VERSION=""
+PKG_MANAGER=""
 
 detect_os() {
   if [[ ! -f /etc/os-release ]]; then
@@ -125,11 +133,22 @@ detect_os() {
   source /etc/os-release
   OS="${ID,,}"
   OS_VERSION="${VERSION_ID:-0}"
+
+  # Kali Linux uses debian base
+  if [[ "$OS" == "kali" ]]; then
+    OS="kali"
+    PKG_MANAGER="apt"
+  elif [[ "$OS" =~ ^(ubuntu|debian)$ ]]; then
+    PKG_MANAGER="apt"
+  elif [[ "$OS" =~ ^(centos|rhel|rocky|almalinux)$ ]]; then
+    PKG_MANAGER="yum"
+  elif [[ "$OS" == "fedora" ]]; then
+    PKG_MANAGER="dnf"
+  else
+    error "Unsupported OS: $OS. Supported: Ubuntu, Debian, Kali, CentOS, RHEL, Rocky, AlmaLinux, Fedora"
+  fi
+
   log "Detected OS: ${PRETTY_NAME:-$OS} (version: $OS_VERSION)"
-  case "$OS" in
-    ubuntu|debian|centos|rhel|fedora|rocky|almalinux) ;;
-    *) error "Unsupported OS: $OS" ;;
-  esac
 }
 
 # =============================================================================
@@ -149,41 +168,33 @@ check_internet() {
 find_free_port() {
   local port="$1"
   while ss -tlnp 2>/dev/null | grep -q ":${port} "; do
-    warn "Port $port is busy — trying port $((port + 1))..."
+    warn "Port $port is busy — trying $((port + 1))..."
     port=$((port + 1))
   done
   echo "$port"
 }
 
 # =============================================================================
-# DOWNLOAD WITH RETRY  (supports both wget and curl)
+# DOWNLOAD WITH RETRY — supports wget and curl
 # =============================================================================
 download_file() {
-  local url="$1"
-  local dest="$2"
-  local label="$3"
-  local attempts=3
-  local delay=5
+  local url="$1" dest="$2" label="$3"
   local i
 
-  for ((i=1; i<=attempts; i++)); do
-    log "Downloading $label (attempt $i/$attempts)..."
+  for ((i=1; i<=3; i++)); do
+    log "Downloading $label (attempt $i/3)..."
     if command -v wget &>/dev/null; then
-      if wget -q --show-progress --timeout=120 --tries=1 -O "$dest" "$url" 2>/dev/null; then
-        success "$label downloaded"
-        return 0
-      fi
-    elif command -v curl &>/dev/null; then
-      if curl -fsSL --max-time 120 -o "$dest" "$url" 2>/dev/null; then
-        success "$label downloaded"
-        return 0
-      fi
+      wget -q --show-progress --timeout=120 --tries=1 -O "$dest" "$url" 2>/dev/null && \
+        { success "$label downloaded"; return 0; }
+    else
+      curl -fsSL --max-time 120 -o "$dest" "$url" 2>/dev/null && \
+        { success "$label downloaded"; return 0; }
     fi
-    warn "Download failed. Retrying in ${delay}s..."
-    sleep "$delay"
+    warn "Download failed. Retrying in 5s..."
+    sleep 5
     rm -f "$dest"
   done
-  error "Failed to download $label after $attempts attempts."
+  error "Failed to download $label after 3 attempts."
 }
 
 # =============================================================================
@@ -191,30 +202,18 @@ download_file() {
 # =============================================================================
 pkg_update() {
   log "Updating package lists..."
-  case "$OS" in
-    ubuntu|debian)
-      DEBIAN_FRONTEND=noninteractive apt-get update -y -qq 2>/dev/null || true
-      ;;
-    centos|rhel|rocky|almalinux)
-      yum makecache -y -q 2>/dev/null || true
-      ;;
-    fedora)
-      dnf makecache -y -q 2>/dev/null || true
-      ;;
+  case "$PKG_MANAGER" in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get update -y -qq 2>/dev/null || true ;;
+    yum) yum makecache -y -q 2>/dev/null || true ;;
+    dnf) dnf makecache -y -q 2>/dev/null || true ;;
   esac
 }
 
 pkg_install() {
-  case "$OS" in
-    ubuntu|debian)
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" 2>/dev/null
-      ;;
-    centos|rhel|rocky|almalinux)
-      yum install -y -q "$@" 2>/dev/null
-      ;;
-    fedora)
-      dnf install -y -q "$@" 2>/dev/null
-      ;;
+  case "$PKG_MANAGER" in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" 2>/dev/null ;;
+    yum) yum install -y -q "$@" 2>/dev/null ;;
+    dnf) dnf install -y -q "$@" 2>/dev/null ;;
   esac
 }
 
@@ -229,13 +228,10 @@ service_enable() {
 
   local i
   for i in {1..30}; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-      success "$svc is running"
-      return 0
-    fi
+    systemctl is-active --quiet "$svc" 2>/dev/null && { success "$svc is running"; return 0; }
     sleep 1
   done
-  warn "$svc did not start within 30s — check: journalctl -u $svc -n 50"
+  warn "$svc did not start in 30s — check: journalctl -u $svc -n 50"
   return 1
 }
 
@@ -247,22 +243,16 @@ install_java() {
     warn "Java already installed — skipping"
     return 0
   fi
-
   log "Installing Java 17..."
-  case "$OS" in
-    ubuntu|debian)
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openjdk-17-jdk 2>/dev/null \
-        || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq default-jdk 2>/dev/null \
-        || error "Could not install Java. Install Java 17 manually and re-run."
+  case "$PKG_MANAGER" in
+    apt)
+      pkg_install openjdk-17-jdk 2>/dev/null || pkg_install default-jdk || error "Could not install Java."
       ;;
-    centos|rhel|rocky|almalinux)
-      yum install -y -q java-17-openjdk 2>/dev/null \
-        || yum install -y -q java-11-openjdk 2>/dev/null \
-        || error "Could not install Java."
+    yum)
+      yum install -y -q java-17-openjdk 2>/dev/null || yum install -y -q java-11-openjdk || error "Could not install Java."
       ;;
-    fedora)
-      dnf install -y -q java-17-openjdk 2>/dev/null \
-        || error "Could not install Java 17."
+    dnf)
+      dnf install -y -q java-17-openjdk || error "Could not install Java."
       ;;
   esac
   success "Java installed"
@@ -275,18 +265,18 @@ install_prerequisites() {
   log "Installing prerequisites..."
   pkg_update
 
-  case "$OS" in
-    ubuntu|debian)
+  case "$PKG_MANAGER" in
+    apt)
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         curl wget gnupg gnupg2 apt-transport-https \
-        lsb-release ca-certificates unzip net-tools socat 2>/dev/null || true
+        lsb-release ca-certificates unzip net-tools 2>/dev/null || true
       ;;
-    centos|rhel|rocky|almalinux)
+    yum)
       yum install -y -q epel-release 2>/dev/null || true
-      yum install -y -q curl wget unzip net-tools socat 2>/dev/null || true
+      yum install -y -q curl wget unzip net-tools 2>/dev/null || true
       ;;
-    fedora)
-      dnf install -y -q curl wget unzip net-tools socat 2>/dev/null || true
+    dnf)
+      dnf install -y -q curl wget unzip net-tools 2>/dev/null || true
       ;;
   esac
 
@@ -295,8 +285,38 @@ install_prerequisites() {
 }
 
 # =============================================================================
+# DOCKER — auto install on every OS
+# =============================================================================
+install_docker() {
+  if command -v docker &>/dev/null && docker info &>/dev/null 2>/dev/null; then
+    warn "Docker already running — skipping"
+    return 0
+  fi
+
+  log "Installing Docker..."
+
+  # Use official Docker install script — works on all supported OS
+  if curl -fsSL https://get.docker.com -o /tmp/get-docker.sh 2>/dev/null; then
+    bash /tmp/get-docker.sh 2>/dev/null && rm -f /tmp/get-docker.sh
+  fi
+
+  # Fallback if official script fails
+  if ! command -v docker &>/dev/null; then
+    case "$PKG_MANAGER" in
+      apt) pkg_install docker.io ;;
+      yum) yum install -y -q docker ;;
+      dnf) dnf install -y -q docker ;;
+    esac
+  fi
+
+  command -v docker &>/dev/null || error "Failed to install Docker."
+
+  service_enable docker || error "Docker failed to start."
+  success "Docker installed and running"
+}
+
+# =============================================================================
 # RABBITMQ
-# Uses official RabbitMQ team script — most reliable method
 # =============================================================================
 install_rabbitmq() {
   log "Installing RabbitMQ..."
@@ -309,50 +329,18 @@ install_rabbitmq() {
   RABBITMQ_PORT=$(find_free_port "$RABBITMQ_PORT")
   RABBITMQ_MGMT_PORT=$(find_free_port "$RABBITMQ_MGMT_PORT")
 
-  case "$OS" in
-    ubuntu|debian)
-      # Clean any previous failed setup
-      rm -f /usr/share/keyrings/rabbitmq*.gpg
-      rm -f /etc/apt/sources.list.d/rabbitmq*.list
-      DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq rabbitmq-server 2>/dev/null || true
-      DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -qq 2>/dev/null || true
-
-      # Install Erlang first (RabbitMQ dependency)
-      log "Installing Erlang..."
-      curl -fsSL https://packages.erlang-solutions.com/ubuntu/erlang_solutions.asc \
-        | gpg --dearmor -o /usr/share/keyrings/erlang.gpg 2>/dev/null || true
-
-      echo "deb [signed-by=/usr/share/keyrings/erlang.gpg] https://packages.erlang-solutions.com/ubuntu $(lsb_release -cs) contrib" \
-        > /etc/apt/sources.list.d/erlang.list
-
-      DEBIAN_FRONTEND=noninteractive apt-get update -y -qq 2>/dev/null || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq erlang 2>/dev/null \
-        || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq erlang-base 2>/dev/null \
-        || warn "Erlang install had issues — continuing..."
-
-      # Install RabbitMQ
-      curl -fsSL https://packagecloud.io/rabbitmq/rabbitmq-server/gpgkey \
-        | gpg --dearmor -o /usr/share/keyrings/rabbitmq.gpg 2>/dev/null || true
-
-      echo "deb [signed-by=/usr/share/keyrings/rabbitmq.gpg] https://packagecloud.io/rabbitmq/rabbitmq-server/ubuntu/ $(lsb_release -cs) main" \
-        > /etc/apt/sources.list.d/rabbitmq.list
-
-      DEBIAN_FRONTEND=noninteractive apt-get update -y -qq 2>/dev/null || true
-      DEBIAN_FRONTEND=noninteractive apt-get -f install -y -qq 2>/dev/null || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rabbitmq-server 2>/dev/null \
-        || error "Failed to install RabbitMQ. Run: apt-get install rabbitmq-server"
+  case "$PKG_MANAGER" in
+    apt)
+      pkg_update
+      # Install Erlang dependencies from default repo — no external repo needed
+      pkg_install erlang-base erlang-crypto erlang-mnesia \
+        erlang-public-key erlang-ssl erlang-syntax-tools \
+        erlang-tools erlang-asn1 erlang-inets 2>/dev/null || true
+      pkg_install rabbitmq-server || error "Failed to install RabbitMQ."
       ;;
-
-    centos|rhel|rocky|almalinux)
-      # Install Erlang first
+    yum)
       yum install -y -q epel-release 2>/dev/null || true
       yum install -y -q erlang 2>/dev/null || true
-
-      curl -fsSL https://packagecloud.io/rabbitmq/rabbitmq-server/gpgkey \
-        -o /tmp/rabbitmq.gpg 2>/dev/null || true
-      rpm --import /tmp/rabbitmq.gpg 2>/dev/null || true
-      rm -f /tmp/rabbitmq.gpg
-
       cat > /etc/yum.repos.d/rabbitmq.repo <<'EOF'
 [rabbitmq]
 name=RabbitMQ
@@ -360,24 +348,20 @@ baseurl=https://packagecloud.io/rabbitmq/rabbitmq-server/el/8/$basearch
 gpgcheck=0
 enabled=1
 EOF
-      yum install -y -q rabbitmq-server 2>/dev/null \
-        || error "Failed to install RabbitMQ."
+      yum install -y -q rabbitmq-server || error "Failed to install RabbitMQ."
       ;;
-
-    fedora)
-      dnf install -y -q erlang rabbitmq-server 2>/dev/null \
-        || error "Failed to install RabbitMQ."
+    dnf)
+      dnf install -y -q erlang rabbitmq-server || error "Failed to install RabbitMQ."
       ;;
   esac
 
-  # Configure ports
+  # Write port config
   mkdir -p /etc/rabbitmq
   cat > /etc/rabbitmq/rabbitmq.conf <<EOF
 listeners.tcp.default = $RABBITMQ_PORT
 management.listener.port = $RABBITMQ_MGMT_PORT
 EOF
 
-  # Enable management plugin
   rabbitmq-plugins enable rabbitmq_management 2>/dev/null || true
 
   if service_enable rabbitmq-server; then
@@ -401,117 +385,76 @@ install_redis() {
 
   REDIS_PORT=$(find_free_port "$REDIS_PORT")
 
-  case "$OS" in
-    ubuntu|debian)
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq redis-server 2>/dev/null \
-        || error "Failed to install Redis."
-
-      local conf="/etc/redis/redis.conf"
-      if [[ -f "$conf" ]]; then
-        sed -i 's/^bind .*/bind 127.0.0.1/' "$conf"
-        sed -i "s/^port .*/port $REDIS_PORT/" "$conf"
-        # Allow systemd to manage redis
-        sed -i 's/^daemonize yes/daemonize no/' "$conf" 2>/dev/null || true
-        sed -i 's/^supervised no/supervised systemd/' "$conf" 2>/dev/null || true
-      fi
-
-      if service_enable redis-server; then
-        success "Redis ready → Port: $REDIS_PORT"
-      else
-        warn "Redis installed but not running — check: journalctl -u redis-server -n 50"
-      fi
-      ;;
-
-    centos|rhel|rocky|almalinux)
-      yum install -y -q redis 2>/dev/null \
-        || error "Failed to install Redis."
-
-      local conf="/etc/redis.conf"
-      if [[ -f "$conf" ]]; then
-        sed -i 's/^bind .*/bind 127.0.0.1/' "$conf"
-        sed -i "s/^port .*/port $REDIS_PORT/" "$conf"
-      fi
-
-      if service_enable redis; then
-        success "Redis ready → Port: $REDIS_PORT"
-      else
-        warn "Redis installed but not running — check: journalctl -u redis -n 50"
-      fi
-      ;;
-
-    fedora)
-      dnf install -y -q redis 2>/dev/null \
-        || error "Failed to install Redis."
-
-      local conf="/etc/redis.conf"
-      if [[ -f "$conf" ]]; then
-        sed -i 's/^bind .*/bind 127.0.0.1/' "$conf"
-        sed -i "s/^port .*/port $REDIS_PORT/" "$conf"
-      fi
-
-      if service_enable redis; then
-        success "Redis ready → Port: $REDIS_PORT"
-      else
-        warn "Redis installed but not running — check: journalctl -u redis -n 50"
-      fi
-      ;;
+  case "$PKG_MANAGER" in
+    apt) pkg_install redis-server || error "Failed to install Redis." ;;
+    yum) yum install -y -q redis || error "Failed to install Redis." ;;
+    dnf) dnf install -y -q redis || error "Failed to install Redis." ;;
   esac
+
+  # Find and configure redis.conf
+  local conf
+  conf=$(find /etc/redis /etc -maxdepth 2 -name "redis.conf" 2>/dev/null | head -1)
+
+  if [[ -f "$conf" ]]; then
+    sed -i 's/^bind .*/bind 127.0.0.1/'   "$conf"
+    sed -i "s/^port .*/port $REDIS_PORT/" "$conf"
+    sed -i 's/^daemonize yes/daemonize no/' "$conf" 2>/dev/null || true
+    sed -i 's/^supervised no/supervised systemd/' "$conf" 2>/dev/null || true
+  fi
+
+  # Detect correct service name
+  local svc="redis-server"
+  systemctl list-unit-files 2>/dev/null | grep -q "^redis.service" && svc="redis"
+
+  if service_enable "$svc"; then
+    success "Redis ready → Port: $REDIS_PORT (localhost only — secure)"
+  else
+    warn "Redis installed but not running — check: journalctl -u $svc -n 50"
+  fi
 }
 
 # =============================================================================
-# KEYCLOAK
+# KEYCLOAK — DOCKER CONTAINER
 # =============================================================================
 install_keycloak() {
-  log "Installing Keycloak ${KEYCLOAK_VERSION}..."
+  log "Installing Keycloak ${KEYCLOAK_VERSION} as Docker container..."
 
   KEYCLOAK_PORT=$(find_free_port "$KEYCLOAK_PORT")
 
-  if [[ ! -d /opt/keycloak ]]; then
-    local url="https://github.com/keycloak/keycloak/releases/download/${KEYCLOAK_VERSION}/keycloak-${KEYCLOAK_VERSION}.tar.gz"
-    download_file "$url" /tmp/keycloak.tar.gz "Keycloak ${KEYCLOAK_VERSION}"
+  # Install Docker first
+  install_docker
 
-    tar -xzf /tmp/keycloak.tar.gz -C /opt/ 2>/dev/null \
-      || error "Failed to extract Keycloak."
-    mv "/opt/keycloak-${KEYCLOAK_VERSION}" /opt/keycloak
-    rm -f /tmp/keycloak.tar.gz
-  else
-    warn "Keycloak already at /opt/keycloak — skipping download"
-  fi
+  # Remove old container if exists
+  docker rm -f keycloak 2>/dev/null || true
 
-  # Create system user
-  if ! id keycloak &>/dev/null; then
-    useradd --system --no-create-home --shell /sbin/nologin keycloak 2>/dev/null || true
-  fi
+  # Pull Keycloak image
+  log "Pulling Keycloak ${KEYCLOAK_VERSION} image..."
+  docker pull quay.io/keycloak/keycloak:${KEYCLOAK_VERSION} 2>/dev/null \
+    || error "Failed to pull Keycloak image. Check internet connection."
 
-  chown -R keycloak:keycloak /opt/keycloak
-  chmod +x /opt/keycloak/bin/kc.sh
+  # Run Keycloak container
+  docker run -d \
+    --name keycloak \
+    --restart always \
+    -p "${KEYCLOAK_PORT}:8080" \
+    -e KEYCLOAK_ADMIN="${KEYCLOAK_ADMIN_USER}" \
+    -e KEYCLOAK_ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASS}" \
+    quay.io/keycloak/keycloak:${KEYCLOAK_VERSION} \
+    start-dev \
+    || error "Failed to start Keycloak container."
 
-  # Create systemd service
-  cat > /etc/systemd/system/keycloak.service <<EOF
-[Unit]
-Description=Keycloak Identity Provider
-After=network.target
-
-[Service]
-User=keycloak
-Group=keycloak
-ExecStart=/opt/keycloak/bin/kc.sh start-dev --http-port=${KEYCLOAK_PORT}
-Restart=on-failure
-RestartSec=15
-StandardOutput=journal
-StandardError=journal
-LimitNOFILE=65536
-Environment=JAVA_OPTS="-Xms512m -Xmx1024m"
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  if service_enable keycloak; then
-    success "Keycloak ready → http://localhost:${KEYCLOAK_PORT}"
-  else
-    warn "Keycloak installed but not running — check: journalctl -u keycloak -n 50"
-  fi
+  # Wait for container to be running
+  log "Waiting for Keycloak to start..."
+  local i
+  for i in {1..60}; do
+    if docker ps 2>/dev/null | grep -q "keycloak"; then
+      success "Keycloak container is running"
+      success "Keycloak ready → http://localhost:${KEYCLOAK_PORT}  (${KEYCLOAK_ADMIN_USER} / ${KEYCLOAK_ADMIN_PASS})"
+      return 0
+    fi
+    sleep 1
+  done
+  warn "Keycloak may still be booting — check: docker logs keycloak"
 }
 
 # =============================================================================
@@ -527,10 +470,8 @@ install_jasper() {
   if [[ ! -d "$install_dir" ]]; then
     local url="https://downloads.sourceforge.net/project/jasperserver/JasperReports%20Server/${JASPER_VERSION}/TIB_js-jrs-cp_${JASPER_VERSION}_bin.zip"
     download_file "$url" /tmp/jasper.zip "JasperReports ${JASPER_VERSION}"
-
     mkdir -p "$install_dir"
-    unzip -q /tmp/jasper.zip -d "$install_dir" 2>/dev/null \
-      || error "Failed to extract JasperReports."
+    unzip -q /tmp/jasper.zip -d "$install_dir" 2>/dev/null || error "Failed to extract JasperReports."
     rm -f /tmp/jasper.zip
   else
     warn "JasperReports already at $install_dir — skipping download"
@@ -540,8 +481,7 @@ install_jasper() {
   installer=$(find "$install_dir" -maxdepth 4 -name "js-install-ce.sh" 2>/dev/null | head -1)
 
   if [[ -z "$installer" ]]; then
-    warn "JasperReports installer script not found in $install_dir"
-    warn "Navigate to $install_dir and run: sudo bash js-install-ce.sh"
+    warn "JasperReports installer not found — run manually: cd $install_dir && sudo bash js-install-ce.sh"
     return 0
   fi
 
@@ -554,13 +494,13 @@ install_jasper() {
   if [[ -n "$props" ]]; then
     sed -i "s/^httpPort=.*/httpPort=${JASPER_PORT}/" "$props" 2>/dev/null || true
     if bash "$installer" "$props" 2>/dev/null; then
-      success "JasperReports installed → http://localhost:${JASPER_PORT}/jasperserver"
+      success "JasperReports installed → http://localhost:${JASPER_PORT}/jasperserver  (jasperadmin / jasperadmin)"
     else
       warn "JasperReports installer had errors — check logs in $install_dir"
     fi
   else
     if bash "$installer" 2>/dev/null; then
-      success "JasperReports installed → http://localhost:${JASPER_PORT}/jasperserver"
+      success "JasperReports installed → http://localhost:${JASPER_PORT}/jasperserver  (jasperadmin / jasperadmin)"
     else
       warn "JasperReports installer had errors — check logs in $install_dir"
     fi
@@ -574,8 +514,7 @@ PASS=0
 FAIL=0
 
 check_test() {
-  local name="$1"
-  local cmd="$2"
+  local name="$1" cmd="$2"
   if eval "$cmd" &>/dev/null; then
     echo -e "  ${GREEN}[PASS]${RESET} $name"
     ((PASS++))
@@ -585,9 +524,8 @@ check_test() {
   fi
 }
 
-check_optional_test() {
-  local name="$1"
-  local cmd="$2"
+check_optional() {
+  local name="$1" cmd="$2"
   if eval "$cmd" &>/dev/null; then
     echo -e "  ${GREEN}[PASS]${RESET} $name"
     ((PASS++))
@@ -603,35 +541,37 @@ run_smoke_tests() {
 
   if [[ "$INSTALL_RABBITMQ" == true ]]; then
     echo -e "${BOLD}  RabbitMQ${RESET}"
-    check_test          "  Service is running"                   "systemctl is-active rabbitmq-server"
-    check_test          "  AMQP port $RABBITMQ_PORT open"        "ss -tlnp | grep -q ':${RABBITMQ_PORT}'"
-    check_test          "  Management port $RABBITMQ_MGMT_PORT"  "ss -tlnp | grep -q ':${RABBITMQ_MGMT_PORT}'"
+    check_test     "  Service running"              "systemctl is-active rabbitmq-server"
+    check_test     "  AMQP port $RABBITMQ_PORT"     "ss -tlnp | grep -q ':${RABBITMQ_PORT}'"
+    check_test     "  UI port $RABBITMQ_MGMT_PORT"  "ss -tlnp | grep -q ':${RABBITMQ_MGMT_PORT}'"
     echo ""
   fi
 
   if [[ "$INSTALL_REDIS" == true ]]; then
     echo -e "${BOLD}  Redis${RESET}"
-    check_test          "  Service is running"                   "systemctl is-active redis-server || systemctl is-active redis"
-    check_test          "  Port $REDIS_PORT open"                "ss -tlnp | grep -q ':${REDIS_PORT}'"
-    check_test          "  Responds to PING"                     "redis-cli -p ${REDIS_PORT} ping | grep -qi pong"
+    check_test     "  Service running"              "systemctl is-active redis-server || systemctl is-active redis"
+    check_test     "  Port $REDIS_PORT open"        "ss -tlnp | grep -q ':${REDIS_PORT}'"
+    check_test     "  Responds to PING"             "redis-cli -p ${REDIS_PORT} ping | grep -qi pong"
     echo ""
   fi
 
   if [[ "$INSTALL_KEYCLOAK" == true ]]; then
-    echo -e "${BOLD}  Keycloak${RESET}"
-    check_test          "  Service is running"                   "systemctl is-active keycloak"
-    check_test          "  Port $KEYCLOAK_PORT open"             "ss -tlnp | grep -q ':${KEYCLOAK_PORT}'"
+    echo -e "${BOLD}  Keycloak (Docker)${RESET}"
+    check_test     "  Docker running"               "systemctl is-active docker"
+    check_test     "  Container running"            "docker ps | grep -q keycloak"
+    check_test     "  Port $KEYCLOAK_PORT open"     "ss -tlnp | grep -q ':${KEYCLOAK_PORT}'"
     echo ""
   fi
 
   if [[ "$INSTALL_JASPER" == true ]]; then
     echo -e "${BOLD}  JasperReports${RESET}"
-    check_optional_test "  Install directory exists"             "test -d /opt/jasperreports-server"
+    check_optional "  Install directory exists"     "test -d /opt/jasperreports-server"
     echo ""
   fi
 
   echo -e "${BOLD}  System${RESET}"
-  check_test            "  Java installed"                       "java -version 2>&1 | grep -qE '17|21|11'"
+  check_test       "  Java installed"               "java -version 2>&1 | grep -qE '17|21|11'"
+  check_test       "  Docker installed"             "command -v docker"
 
   echo ""
   echo -e "  ──────────────────────────────────────────────"
@@ -640,7 +580,11 @@ run_smoke_tests() {
     echo -e "  ${GREEN}${BOLD}All tests passed ($PASS/$total)${RESET}"
   else
     echo -e "  ${RED}${BOLD}$FAIL test(s) failed — $PASS/$total passed${RESET}"
-    echo -e "  ${YELLOW}Tip:${RESET} journalctl -u <service-name> -n 50"
+    echo ""
+    echo -e "  ${YELLOW}Check logs:${RESET}"
+    echo -e "    RabbitMQ  → journalctl -u rabbitmq-server -n 50"
+    echo -e "    Redis     → journalctl -u redis-server -n 50"
+    echo -e "    Keycloak  → docker logs keycloak"
   fi
   echo ""
 }
@@ -654,26 +598,26 @@ print_summary() {
   echo -e "${BOLD}${GREEN}║              Installation Complete!                          ║${RESET}"
   echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════╝${RESET}"
   echo ""
-  echo -e "  ${BOLD}Service         URL / Port                              Credentials${RESET}"
-  echo -e "  ──────────────────────────────────────────────────────────────────────"
-
-  if [[ "$INSTALL_RABBITMQ" == true ]]; then
-    echo -e "  ${CYAN}RabbitMQ${RESET}        AMQP  → localhost:${RABBITMQ_PORT}"
-    echo -e "                  UI    → http://localhost:${RABBITMQ_MGMT_PORT}           guest / guest"
-  fi
-  if [[ "$INSTALL_REDIS" == true ]]; then
-    echo -e "  ${CYAN}Redis${RESET}           Port  → localhost:${REDIS_PORT}                No password"
-  fi
-  if [[ "$INSTALL_KEYCLOAK" == true ]]; then
-    echo -e "  ${CYAN}Keycloak${RESET}        UI    → http://localhost:${KEYCLOAK_PORT}               Set on first login"
-  fi
-  if [[ "$INSTALL_JASPER" == true ]]; then
-    echo -e "  ${CYAN}JasperReports${RESET}   UI    → http://localhost:${JASPER_PORT}/jasperserver    jasperadmin / jasperadmin"
-  fi
-
-  echo -e "  ──────────────────────────────────────────────────────────────────────"
+  echo -e "  ${BOLD}Service            URL / Port                         Credentials${RESET}"
+  echo -e "  ───────────────────────────────────────────────────────────────────────"
+  [[ "$INSTALL_RABBITMQ" == true ]] && {
+    echo -e "  ${CYAN}RabbitMQ${RESET}           AMQP → localhost:${RABBITMQ_PORT}"
+    echo -e "                     UI   → http://localhost:${RABBITMQ_MGMT_PORT}        guest / guest"
+  }
+  [[ "$INSTALL_REDIS" == true ]] && \
+    echo -e "  ${CYAN}Redis${RESET}              Port → localhost:${REDIS_PORT}             No password (localhost only)"
+  [[ "$INSTALL_KEYCLOAK" == true ]] && \
+    echo -e "  ${CYAN}Keycloak${RESET} (Docker)  UI   → http://localhost:${KEYCLOAK_PORT}           ${KEYCLOAK_ADMIN_USER} / ${KEYCLOAK_ADMIN_PASS}"
+  [[ "$INSTALL_JASPER" == true ]] && \
+    echo -e "  ${CYAN}JasperReports${RESET}      UI   → http://localhost:${JASPER_PORT}/jasperserver jasperadmin / jasperadmin"
+  echo -e "  ───────────────────────────────────────────────────────────────────────"
   echo ""
   echo -e "  ${YELLOW}Note:${RESET} Replace 'localhost' with your server IP to access from browser."
+  echo ""
+  echo -e "  ${BOLD}Useful Commands:${RESET}"
+  echo -e "  Keycloak  → docker ps | docker logs keycloak | docker restart keycloak"
+  echo -e "  RabbitMQ  → systemctl status rabbitmq-server"
+  echo -e "  Redis     → systemctl status redis-server"
   echo ""
 }
 
@@ -699,10 +643,10 @@ main() {
   check_internet
   install_prerequisites
 
-  if [[ "$INSTALL_RABBITMQ" == true ]]; then install_rabbitmq; fi
-  if [[ "$INSTALL_REDIS"    == true ]]; then install_redis;    fi
-  if [[ "$INSTALL_KEYCLOAK" == true ]]; then install_keycloak; fi
-  if [[ "$INSTALL_JASPER"   == true ]]; then install_jasper;   fi
+  [[ "$INSTALL_RABBITMQ" == true ]] && install_rabbitmq
+  [[ "$INSTALL_REDIS"    == true ]] && install_redis
+  [[ "$INSTALL_KEYCLOAK" == true ]] && install_keycloak
+  [[ "$INSTALL_JASPER"   == true ]] && install_jasper
 
   print_summary
   run_smoke_tests
